@@ -21,6 +21,10 @@ def create_empty_db(database_path: Path):
     if database_path.exists():
         logger.warning("The database already exists, deleting it.")
         database_path.unlink()
+    # Interrupted SQLite writers may leave these sidecars behind.  They cannot
+    # be reused after deleting the main database file.
+    for suffix in ("-shm", "-wal"):
+        Path(str(database_path) + suffix).unlink(missing_ok=True)
     logger.info("Creating an empty database...")
     with pycolmap.Database.open(database_path) as _:
         pass
@@ -90,6 +94,36 @@ def incremental_mapping(
     return reconstructions
 
 
+def largest_reconstruction(reconstructions: dict[int, pycolmap.Reconstruction]):
+    if len(reconstructions) == 0:
+        return None, None
+    largest_index, reconstruction = max(
+        reconstructions.items(), key=lambda item: item[1].num_reg_images()
+    )
+    return largest_index, reconstruction
+
+
+def rig_config_requires_inference(rig_config: Path) -> bool:
+    """Return whether a COLMAP rig config omits non-reference sensor poses."""
+    configs = pycolmap.read_rig_config(str(rig_config))
+    return any(
+        not camera.ref_sensor and camera.cam_from_rig is None
+        for config in configs
+        for camera in config.cameras
+    )
+
+
+def apply_rig_config(
+    database_path: Path,
+    rig_config: Path,
+    reconstruction: Optional[pycolmap.Reconstruction] = None,
+) -> None:
+    """Apply a COLMAP rig config to a database and optional reconstruction."""
+    configs = pycolmap.read_rig_config(str(rig_config))
+    with pycolmap.Database.open(database_path) as database:
+        pycolmap.apply_rig_config(configs, database, reconstruction)
+
+
 def run_reconstruction(
     sfm_dir: Path,
     database_path: Path,
@@ -114,14 +148,9 @@ def run_reconstruction(
         return None
     logger.info(f"Reconstructed {len(reconstructions)} model(s).")
 
-    largest_index = None
-    largest_num_images = 0
-    for index, rec in reconstructions.items():
-        num_images = rec.num_reg_images()
-        if num_images > largest_num_images:
-            largest_index = index
-            largest_num_images = num_images
-    assert largest_index is not None
+    largest_index, reconstruction = largest_reconstruction(reconstructions)
+    assert largest_index is not None and reconstruction is not None
+    largest_num_images = reconstruction.num_reg_images()
     logger.info(
         f"Largest model is #{largest_index} " f"with {largest_num_images} images."
     )
@@ -135,8 +164,10 @@ def run_reconstruction(
     ]:
         if (sfm_dir / filename).exists():
             (sfm_dir / filename).unlink()
-        shutil.move(str(models_path / str(largest_index) / filename), str(sfm_dir))
-    return reconstructions[largest_index]
+        source = models_path / str(largest_index) / filename
+        if source.exists():
+            shutil.move(str(source), str(sfm_dir))
+    return reconstruction
 
 
 def main(
@@ -152,6 +183,7 @@ def main(
     image_list: Optional[List[str]] = None,
     image_options: Optional[Dict[str, Any]] = None,
     mapper_options: Optional[Dict[str, Any]] = None,
+    rig_config: Optional[Path] = None,
 ) -> pycolmap.Reconstruction:
     assert features.exists(), features
     assert pairs.exists(), pairs
@@ -165,6 +197,13 @@ def main(
 
     create_empty_db(database)
     import_images(image_dir, database, camera_mode, image_list, image_options)
+    infer_rig_poses = False
+    if rig_config is not None:
+        if not rig_config.exists():
+            raise FileNotFoundError(f"Rig config does not exist: {rig_config}")
+        infer_rig_poses = rig_config_requires_inference(rig_config)
+        if not infer_rig_poses:
+            apply_rig_config(database, rig_config)
     image_ids = get_image_ids(database)
     with pycolmap.Database.open(database) as db:
         import_features(image_ids, db, features)
@@ -178,9 +217,22 @@ def main(
         )
     if not skip_geometric_verification:
         estimation_and_geometric_verification(database, pairs, verbose)
-    reconstruction = run_reconstruction(
-        sfm_dir, database, image_dir, verbose, mapper_options
-    )
+    if infer_rig_poses:
+        initial_models = sfm_dir / "rig-initial-models"
+        if initial_models.exists():
+            shutil.rmtree(initial_models)
+        initial_models.mkdir(parents=True)
+        logger.info("Running an unconstrained reconstruction to infer rig sensor poses...")
+        with OutputCapture(verbose):
+            initial_reconstructions = incremental_mapping(
+                database, image_dir, initial_models, options=mapper_options
+            )
+        _, initial_reconstruction = largest_reconstruction(initial_reconstructions)
+        if initial_reconstruction is None:
+            raise RuntimeError("Could not reconstruct an initial model to infer rig sensor poses.")
+        apply_rig_config(database, rig_config, initial_reconstruction)
+        logger.info("Inferred rig sensor poses; re-running reconstruction with rig constraints...")
+    reconstruction = run_reconstruction(sfm_dir, database, image_dir, verbose, mapper_options)
     if reconstruction is not None:
         logger.info(
             f"Reconstruction statistics:\n{reconstruction.summary()}"
@@ -207,6 +259,7 @@ if __name__ == "__main__":
     parser.add_argument("--skip_geometric_verification", action="store_true")
     parser.add_argument("--min_match_score", type=float)
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--rig_config", type=Path)
 
     parser.add_argument(
         "--image_options",
