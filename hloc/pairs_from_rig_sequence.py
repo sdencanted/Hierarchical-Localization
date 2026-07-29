@@ -12,11 +12,12 @@ from itertools import combinations
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
+import h5py
 import numpy as np
 import torch
 
 from . import logger
-from .pairs_from_retrieval import get_descriptors, pairs_from_score_matrix
+from .pairs_from_retrieval import pairs_from_score_matrix
 
 
 Pair = Tuple[str, str]
@@ -117,13 +118,18 @@ def rig_sequence_pairs(
 
 
 def retrieval_pairs(image_list: Sequence[str], descriptors: Path, num_matched: int) -> Set[Pair]:
+    """Build loop-closure pairs from global descriptors stored in an HDF5 file."""
     if num_matched < 1:
         raise ValueError("The number of retrieval loop closures must be at least one.")
     names = list(image_list)
     if len(names) < 2:
         return set()
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    descriptors_tensor = get_descriptors(names, descriptors).to(device)
+    with h5py.File(descriptors, "r", libver="latest") as file:
+        descriptors_tensor = torch.from_numpy(
+            np.stack([file[name]["global_descriptor"].__array__() for name in names])
+        ).float()
+    descriptors_tensor = descriptors_tensor.to(device)
     scores = torch.einsum("id,jd->ij", descriptors_tensor, descriptors_tensor)
     invalid = np.eye(len(names), dtype=bool)
     selected = pairs_from_score_matrix(scores, invalid, min(num_matched, len(names) - 1), min_score=0)
