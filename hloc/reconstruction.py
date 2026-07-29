@@ -66,6 +66,14 @@ def incremental_mapping(
     sfm_path: Path,
     options: Optional[Dict[str, Any]] = None,
 ) -> dict[int, pycolmap.Reconstruction]:
+    """Run COLMAP's incremental SfM pipeline with CUDA-backed BA enabled."""
+    options = {
+        "ba_use_gpu": True,
+        "ba_local_backend": "CASPAR",
+        "ba_global_backend": "CASPAR",
+        **(options or {}),
+    }
+    logger.info("Running incremental SfM reconstruction with GPU optimization enabled...")
     num_images = pycolmap.Database.open(database_path).num_images()
     pbars = []
 
@@ -82,13 +90,82 @@ def incremental_mapping(
         )
         pbars[-1].update(2)
 
-    reconstructions = pycolmap.incremental_mapping(
+    return pycolmap.incremental_mapping(
         database_path,
         image_dir,
         sfm_path,
-        options=options or {},
+        options=options,
         initial_image_pair_callback=restart_progress_bar,
         next_image_callback=lambda: pbars[-1].update(1),
+    )
+
+
+def global_mapping(
+    database_path: Path,
+    image_dir: Path,
+    sfm_path: Path,
+    options: Optional[Dict[str, Any]] = None,
+) -> dict[int, pycolmap.Reconstruction]:
+    """Run COLMAP's global SfM pipeline with GPU optimization enabled."""
+    options = dict(options or {})
+
+    # Preserve the public mapper_options interface used by the incremental
+    # pipeline.  GlobalPipelineOptions stores these controls in nested option
+    # groups instead of exposing the old ba_* fields at its top level.
+    legacy_ba_options = {
+        key: options.pop(key)
+        for key in (
+            "ba_refine_focal_length",
+            "ba_refine_principal_point",
+            "ba_refine_extra_params",
+            "ba_refine_sensor_from_rig",
+            "ba_use_gpu",
+            "ba_gpu_index",
+            "ba_local_backend",
+            "ba_global_backend",
+        )
+        if key in options
+    }
+    logger.info("Running global SfM reconstruction with GPU optimization enabled...")
+    mapping_options = pycolmap.GlobalPipelineOptions(options)
+    mapper = mapping_options.mapper
+
+    # These options select CUDA when the installed COLMAP build supports it.
+    # CASPAR is COLMAP's GPU bundle-adjustment backend.
+    mapper.global_positioning.use_gpu = True
+    mapper.bundle_adjustment.ceres.use_gpu = True
+
+    for old_name, new_name in (
+        ("ba_refine_focal_length", "refine_focal_length"),
+        ("ba_refine_principal_point", "refine_principal_point"),
+        ("ba_refine_extra_params", "refine_extra_params"),
+    ):
+        if old_name in legacy_ba_options:
+            setattr(
+                mapper.bundle_adjustment, new_name, legacy_ba_options[old_name]
+            )
+    if "ba_refine_sensor_from_rig" in legacy_ba_options:
+        refine_sensor_from_rig = legacy_ba_options["ba_refine_sensor_from_rig"]
+        mapper.refine_sensor_from_rig = refine_sensor_from_rig
+        mapper.global_positioning.refine_sensor_from_rig = refine_sensor_from_rig
+        mapper.bundle_adjustment.refine_sensor_from_rig = refine_sensor_from_rig
+    if "ba_gpu_index" in legacy_ba_options:
+        gpu_index = legacy_ba_options["ba_gpu_index"]
+        mapper.global_positioning.gpu_index = gpu_index
+        mapper.bundle_adjustment.ceres.gpu_index = gpu_index
+    # Enable logging output to stderr or stdout
+    pycolmap.logging.logtostderr = True  # or pycolmap.logging.logtostdout = True
+
+    # Set minimum log level (0 = INFO, 1 = WARNING, etc.)
+    pycolmap.logging.minloglevel = 0
+
+    # Increase the verbose logging level (e.g., level 2 or 3 for deep debug traces)
+    pycolmap.logging.verbose_level = 3
+    reconstructions = pycolmap.global_mapping(
+        database_path,
+        image_dir,
+        sfm_path,
+        options=mapping_options,
     )
 
     return reconstructions
@@ -139,6 +216,9 @@ def run_reconstruction(
     options = {"num_threads": min(multiprocessing.cpu_count(), 16), **options}
 
     with OutputCapture(verbose):
+        # reconstructions = global_mapping(
+        #     database_path, image_dir, models_path, options=options
+        # )
         reconstructions = incremental_mapping(
             database_path, image_dir, models_path, options=options
         )
@@ -203,7 +283,7 @@ def main(
             raise FileNotFoundError(f"Rig config does not exist: {rig_config}")
         infer_rig_poses = rig_config_requires_inference(rig_config)
         if not infer_rig_poses:
-            apply_rig_config(database, rig_config)
+            apply_rig_config(database, rig_config)  
     image_ids = get_image_ids(database)
     with pycolmap.Database.open(database) as db:
         import_features(image_ids, db, features)
@@ -224,7 +304,7 @@ def main(
         initial_models.mkdir(parents=True)
         logger.info("Running an unconstrained reconstruction to infer rig sensor poses...")
         with OutputCapture(verbose):
-            initial_reconstructions = incremental_mapping(
+            initial_reconstructions = global_mapping(
                 database, image_dir, initial_models, options=mapper_options
             )
         _, initial_reconstruction = largest_reconstruction(initial_reconstructions)
@@ -272,7 +352,7 @@ if __name__ == "__main__":
         nargs="+",
         default=[],
         help="List of key=value from {}".format(
-            pycolmap.IncrementalMapperOptions().todict()
+            pycolmap.IncrementalPipelineOptions().todict()
         ),
     )
     args = parser.parse_args().__dict__
@@ -281,7 +361,7 @@ if __name__ == "__main__":
         args.pop("image_options"), pycolmap.ImageReaderOptions()
     )
     mapper_options = parse_option_args(
-        args.pop("mapper_options"), pycolmap.IncrementalMapperOptions()
+        args.pop("mapper_options"), pycolmap.IncrementalPipelineOptions()
     )
 
     main(**args, image_options=image_options, mapper_options=mapper_options)

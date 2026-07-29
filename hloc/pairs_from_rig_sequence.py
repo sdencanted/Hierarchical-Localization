@@ -36,6 +36,38 @@ def _read_config(path: Path) -> list:
     return config
 
 
+def _frame_name_for_camera(name: str, prefix: str) -> Optional[str]:
+    """Return an image's frame name when it belongs to a rig camera.
+
+    Image processing may move a camera stream into a grouping folder such as
+    ``NewGroup_Cam01``.  A COLMAP rig config still identifies that stream as
+    ``Cam01/``.  In addition to the configured prefix, accept a path component
+    named ``CAMERA`` or ``*_CAMERA`` and use the path after that component as
+    the frame name.
+    """
+    if name.startswith(prefix):
+        return name[len(prefix) :]
+
+    camera_name = Path(prefix.rstrip("/")).name
+    # if "09" in camera_name:
+    #     print(camera_name)
+    if not camera_name:
+        return None
+    parts = Path(name).parts
+    # if "09" in camera_name:
+    #     print(parts)
+    matches = [
+        index
+        for index, part in enumerate(parts)
+        if part == camera_name or part.endswith(f"_{camera_name}")
+    ]
+    if len(matches) != 1:
+        return None
+    frame_parts = parts[matches[0] + 1 :]
+    # print(Path(*frame_parts).as_posix() if frame_parts else "")
+    return Path(*frame_parts).as_posix() if frame_parts else ""
+
+
 def rig_sequence_pairs(
     image_list: Sequence[str],
     rig_config: Union[Path, str],
@@ -47,6 +79,7 @@ def rig_sequence_pairs(
         raise ValueError("Rig sequential overlap must be at least one.")
 
     names = sorted(set(image_list))
+    logger.info(f"image cameras: {len(names)}")
     if len(names) != len(image_list):
         raise ValueError("Rig image names must be unique.")
     config = _read_config(Path(rig_config))
@@ -59,6 +92,7 @@ def rig_sequence_pairs(
 
     for rig_index, rig in enumerate(config):
         cameras = rig.get("cameras") if isinstance(rig, dict) else None
+        logger.info(f"Camera names: {cameras}")
         if not isinstance(cameras, list) or len(cameras) < 2:
             raise ValueError(f"Rig {rig_index} must configure at least two cameras.")
         if sum(bool(camera.get("ref_sensor", False)) for camera in cameras) != 1:
@@ -70,11 +104,13 @@ def rig_sequence_pairs(
             prefix = camera.get("image_prefix") if isinstance(camera, dict) else None
             if not isinstance(prefix, str) or not prefix:
                 raise ValueError(f"Rig {rig_index} camera {camera_index} needs an image_prefix.")
+            
             for name in names:
-                if name.startswith(prefix):
+                frame_name = _frame_name_for_camera(name, prefix)
+                # logger.info(f"Frame name for {name}: {frame_name} in prefix {prefix}")
+                if frame_name is not None:
                     if name in assigned:
                         raise ValueError(f"Image {name} matches multiple rig camera prefixes.")
-                    frame_name = name[len(prefix) :]
                     if not frame_name:
                         raise ValueError(f"Image {name} has no frame name after prefix {prefix}.")
                     assigned[name] = (rig_index, camera_index, frame_name)
@@ -127,7 +163,12 @@ def retrieval_pairs(image_list: Sequence[str], descriptors: Path, num_matched: i
     scores = torch.einsum("id,jd->ij", descriptors_tensor, descriptors_tensor)
     invalid = np.eye(len(names), dtype=bool)
     selected = pairs_from_score_matrix(scores, invalid, min(num_matched, len(names) - 1), min_score=0)
-    return {_canonical_pair(names[i], names[j]) for i, j in selected}
+    pairs: Set[Pair] = set()
+    for i, j in selected:
+        pairs.add(_canonical_pair(names[i], names[j]))
+    logger.info("Found %d retrieval loop closure pairs.", len(pairs))
+    return pairs
+    # return {_canonical_pair(names[i], names[j]) for i, j in selected}
 
 
 def main(
@@ -141,11 +182,12 @@ def main(
     loop_closure_num_matched: int = 50,
 ) -> Set[Pair]:
     pairs = rig_sequence_pairs(image_list, rig_config, overlap, quadratic_overlap)
+    logger.info("Found %d rig sequential pairs.", len(pairs))
     if retrieval_loop_closures:
         if retrieval_descriptors is None:
             raise ValueError("Retrieval descriptors are required when loop closures are enabled.")
-        pairs |= retrieval_pairs(image_list, retrieval_descriptors, loop_closure_num_matched)
-    logger.info("Found %d rig sequential pairs.", len(pairs))
+        pairs = pairs | retrieval_pairs(image_list, retrieval_descriptors, loop_closure_num_matched)
+    logger.info("A total of %d rig sequential pairs have been found.", len(pairs))
     ordered_pairs = sorted(pairs)
     with open(output, "w", encoding="utf-8") as file:
         file.write("\n".join(" ".join(pair) for pair in ordered_pairs))
