@@ -186,9 +186,13 @@ def main(
 def find_unique_new_pairs(pairs_all: List[Tuple[str]], match_path: Path = None):
     """Avoid to recompute duplicates to save time."""
     pairs = set()
+    logger.info("Found %d pairs to match.", len(pairs_all))
     for i, j in pairs_all:
         if (j, i) not in pairs:
             pairs.add((i, j))
+        else:
+            logger.warning("Found duplicate pair (%s, %s).", i, j)
+    logger.info("Found %d unique pairs to match.", len(pairs))
     pairs = list(pairs)
     if match_path is not None and match_path.exists():
         with h5py.File(str(match_path), "r", libver="latest") as fd:
@@ -226,9 +230,13 @@ def match_from_paths(
     match_path.parent.mkdir(exist_ok=True, parents=True)
 
     assert pairs_path.exists(), pairs_path
+    
+    logger.info("test")
     pairs = parse_retrieval(pairs_path)
     pairs = [(q, r) for q, rs in pairs.items() for r in rs]
+    logger.info(f"Found {len(pairs)} pairs to match in {pairs_path}.")
     pairs = find_unique_new_pairs(pairs, None if overwrite else match_path)
+    logger.info(f"Found {len(pairs)} unique pairs to match after filtering existing matches.")
     if len(pairs) == 0:
         logger.info("Skipping the matching.")
         return
